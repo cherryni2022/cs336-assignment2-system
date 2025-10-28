@@ -12,6 +12,12 @@ import einx
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW, get_cosine_lr
 import argparse
+import logging
+
+logging.basicConfig(
+    format="%(asctime)s - %(module)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 
 # Define the model sizes (from the table)
 model_configs = {
@@ -30,8 +36,7 @@ model_configs = {
 
 # Constants
 vocab_size = 10_000
-#test_context_lengths = [128, 256, 512, 1024]
-test_context_lengths = [128, 256, 512, 1024]
+context_lengths = [128, 256, 512, 1024]
 batch_size = 8
 rope_theta = 10000.0
 warmup_steps = 5
@@ -72,21 +77,24 @@ def benchmark(model, x, y, mode, model_type, context_length):
     step_fn = step_forward if mode == "forward" else step_forward_backward
 
     # Warm-up
-    print ("start warmup:")
-    with nvtx.range(f"Warmup_{model_type}_{context_length}"):
-        for _ in range(warmup_steps):
+    logging.info("start warmup:")
+    with nvtx.range(f"Warmup_{model_type}_{context_length}_{mode}"):
+        for warmup_step in range(warmup_steps):
             lr = get_cosine_lr(global_step, max_lr, min_lr, warmup_iters, total_iters)
             for group in optimizer.param_groups:
                 group['lr'] = lr
+            start = timeit.default_timer()
             step_fn()
+            end = timeit.default_timer()
+            logging.info(f"warmup step_{warmup_step} mode {mode} takes: {(end - start)*1000} ms")
             global_step += 1
 
     # Timed steps
     times = []
-    print ("start training:")
+    logging.info("start training:")
     torch.cuda.memory._record_memory_history(max_entries=10000)
-    with nvtx.range(f"Training_{model_type}_{context_length}"):
-        for _ in range(benchmark_steps):
+    with nvtx.range(f"Training_{model_type}_{context_length}_{mode}"):
+        for step in range(benchmark_steps):
             start = timeit.default_timer()
             lr = get_cosine_lr(global_step, max_lr, min_lr, warmup_iters, total_iters)
             for group in optimizer.param_groups:
@@ -95,9 +103,12 @@ def benchmark(model, x, y, mode, model_type, context_length):
             step_fn()
             torch.cuda.synchronize()
             global_step += 1
-            end = timeit.default_timer()
-            times.append((end - start) * 1000)
+            take_time = (timeit.default_timer() - start) * 1000
+            times.append(take_time)
+            logging.info(f"train step_{step} mode {mode} takes: {take_time} ms")
+        
 
+    logging.info(f"benchmark model_{model_type},mode_{mode},context_length_{context_length} mean time: {mean(times)} ms, std time: {stdev(times)} ms")
     torch.cuda.memory._dump_snapshot(f"memory_nvtx_{model_type}_{context_length}_{mode}.pickle")
     torch.cuda.memory._record_memory_history(enabled=None)
     return mean(times), stdev(times)
@@ -128,9 +139,13 @@ def main():
     global benchmark_steps
     if args.benchmark_steps:
         benchmark_steps = args.benchmark_steps
+    
+    global context_lengths
+    if args.context_length:
+        context_lengths = [args.context_length]
 
-    results = []
-    configs_to_run = []
+
+    configs_to_run = {}
 
     if args.all:
         configs_to_run = model_configs
@@ -164,7 +179,7 @@ def main():
 
     for mode in modes:
         for model_type, config in configs_to_run.items():
-            for context_length in test_context_lengths:
+            for context_length in context_lengths:
                 print(f"Running {config['size']}, model [{mode}], context_length: {context_length}...")
 
                 model = BasicsTransformerLM(
