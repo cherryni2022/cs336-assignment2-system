@@ -177,6 +177,8 @@ def main():
         print(f"  - {cfg}")
     print()
 
+    results = []
+
     for mode in modes:
         for model_type, config in configs_to_run.items():
             for context_length in context_lengths:
@@ -209,7 +211,7 @@ def main():
 
                 results.append(
                     {
-                        "Size": config["size"],
+                        "model_size": config["size"],
                         "Mode": mode,
                         "d_model": config["d_model"],
                         "d_ff": config["d_ff"],
@@ -227,9 +229,9 @@ def main():
     # Output results
     df = pd.DataFrame(results)
     print(df.to_markdown(index=False))
-
+    save_file = f"benchmark_nvtx_results.md"
     # Save to file
-    with open("benchmark_nvtx_results.md", "w") as f:
+    with open(save_file, "w") as f:
         f.write(df.to_markdown(index=False))
 
 
