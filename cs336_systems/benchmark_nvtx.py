@@ -47,6 +47,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 #cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 def benchmark(model, x, y, mode, model_type, context_length):
+    logging.info(f"start run model: {model_type}, mode: {mode}, context_length: {context_length}")
     model.train()
     #optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     optimizer = AdamW(model.parameters(), lr=1e-3)
@@ -77,40 +78,51 @@ def benchmark(model, x, y, mode, model_type, context_length):
     step_fn = step_forward if mode == "forward" else step_forward_backward
 
     # Warm-up
-    logging.info("start warmup:")
-    with nvtx.range(f"Warmup_{model_type}_{context_length}_{mode}"):
+    logging.info(f"start warmup model: {model_type}, mode: {mode}, context_length: {context_length} ===============")
+    with nvtx.range(f"warmup_{model_type}_{context_length}_{mode}"):
         for warmup_step in range(warmup_steps):
             lr = get_cosine_lr(global_step, max_lr, min_lr, warmup_iters, total_iters)
             for group in optimizer.param_groups:
                 group['lr'] = lr
             start = timeit.default_timer()
-            step_fn()
+            try:
+                step_fn()
+            except torch.cuda.OutOfMemoryError as e:
+                logging.error("warmup step_%s mode %s CUDA OOM: %s", warmup_step, mode, e)
+                torch.cuda.empty_cache()
+                raise
+            torch.cuda.synchronize()
             end = timeit.default_timer()
-            logging.info(f"warmup step_{warmup_step} mode {mode} takes: {(end - start)*1000} ms")
+            logging.info("warmup step_%s mode %s time_spend: %s", warmup_step, mode, {(end - start)*1000} ms)
             global_step += 1
 
     # Timed steps
     times = []
-    logging.info("start training:")
-    torch.cuda.memory._record_memory_history(max_entries=10000)
-    with nvtx.range(f"Training_{model_type}_{context_length}_{mode}"):
+    logging.info(f"start benchmark model: {model_type}, mode: {mode}, context_length: {context_length} ================")
+    #torch.cuda.memory._record_memory_history(max_entries=10000)
+    with nvtx.range(f"train_{model_type}_{context_length}_{mode}"):
         for step in range(benchmark_steps):
             start = timeit.default_timer()
             lr = get_cosine_lr(global_step, max_lr, min_lr, warmup_iters, total_iters)
             for group in optimizer.param_groups:
                 group['lr'] = lr
 
-            step_fn()
+            try:
+                step_fn()
+            except torch.cuda.OutOfMemoryError as e:
+                logging.error("train step_%s mode %s CUDA OOM: %s", step, mode, e)
+                torch.cuda.empty_cache()
+                raise
+            
             torch.cuda.synchronize()
             global_step += 1
             take_time = (timeit.default_timer() - start) * 1000
             times.append(take_time)
-            logging.info(f"train step_{step} mode {mode} takes: {take_time} ms")
-        
-
+            logging.info("train step_%s mode %s time_spend: %s ms", step, mode, take_time)
+    
     logging.info(f"benchmark model_{model_type},mode_{mode},context_length_{context_length} mean time: {mean(times)} ms, std time: {stdev(times)} ms")
-    torch.cuda.memory._dump_snapshot(f"memory_nvtx_{model_type}_{context_length}_{mode}.pickle")
-    torch.cuda.memory._record_memory_history(enabled=None)
+    #torch.cuda.memory._dump_snapshot(f"memory_nvtx_{model_type}_{context_length}_{mode}.pickle")
+    #torch.cuda.memory._record_memory_history(enabled=None)
     return mean(times), stdev(times)
 
 
@@ -208,22 +220,13 @@ def main():
                 )
 
                 try:
-                    stats = benchmark(model, x, y, mode, model_type, context_length)
+                    avg, std = benchmark(model, x, y, mode, model_type, context_length)
                 except torch.cuda.OutOfMemoryError as e:
                     logging.error("Benchmark OOM for model %s, mode %s, context_length %s: %s", config['size'], mode, context_length, e)
-                    stats = {
-                        "mean_total": float('nan'),
-                        "std_total": float('nan'),
-                        "mean_forward": float('nan'),
-                        "std_forward": float('nan'),
-                        "mean_backward": float('nan'),
-                        "std_backward": float('nan'),
-                        "mean_loss": float('nan'),
-                        "std_loss": float('nan'),
-                        "mean_optimizer": float('nan'),
-                        "std_optimizer": float('nan'),
-                    }
-                logging.info(f"model {config['size']} [{mode}]: Avg Time = {stats['mean_total']:.6f}ms, Std Dev = {stats['std_total']:.6f}ms")
+                    avg = float('nan')
+                    std = float('nan')
+
+                logging.info(f"model {config['size']} [{mode}] [context length {context_length}]: Avg Time = {avg:.6f}ms, Std Dev = {std:.6f}ms")
                 del model, x, y 
                 torch.cuda.empty_cache()
                 
@@ -232,14 +235,8 @@ def main():
                         "model_size": config["size"],
                         "Mode": mode,
                         "Context Length": context_length,
-                        "Avg Time (ms)": round(stats['mean_total'], 6),
-                        "Std Dev (ms)": round(stats['std_total'], 6),
-                        "Avg Forward (ms)": round(stats['mean_forward'], 6),
-                        "Std Dev Forward (ms)": round(stats['std_forward'], 6),
-                        "Avg Backward (ms)": round(stats['mean_backward'], 6),
-                        "Std Dev Backward (ms)": round(stats['std_backward'], 6),
-                        "Avg Optimizer (ms)": round(stats['mean_optimizer'], 6),
-                        "Std Dev Optimizer (ms)": round(stats['std_optimizer'], 6),
+                        "Avg Time (ms)": round(avg, 6),
+                        "Std Dev (ms)": round(std, 6),
                     }
                 )
 
