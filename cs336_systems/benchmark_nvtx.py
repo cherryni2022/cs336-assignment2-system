@@ -141,15 +141,18 @@ def main():
         benchmark_steps = args.benchmark_steps
     
     global context_lengths
+    context_name = "all"
     if args.context_length:
+        context_name = f"context_{args.context_length}"
         context_lengths = [args.context_length]
 
 
     configs_to_run = {}
-
+    model_name = "all"
     if args.all:
         configs_to_run = model_configs
     elif args.d_model and args.d_ff and args.num_layers and args.num_heads:
+        model_name = "custom"
         configs_to_run = {
             "custom":{
             "size": "custom",
@@ -162,27 +165,29 @@ def main():
         # 检查model_type是否存在于model_configs中
         if args.model_type not in model_configs:
             raise ValueError(f"Model type '{args.model_type}' not found in model_configs")
+        model_name = args.model_type
         model_config = model_configs[args.model_type]
         configs_to_run = {args.model_type: model_configs[args.model_type]}
     else:
         raise ValueError("Must specify either --all or all custom model hyperparameters.")
     
+    mode_name = "all"
     if args.mode:
+        mode_name = args.mode
         modes = [args.mode]
     else:
         modes = ["forward", "forward_backward"]
 
-    print("\nRunning the following configurations:")
+    logging.info("\nRunning the following configurations:")
     for cfg in configs_to_run:
-        print(f"  - {cfg}")
-    print()
+        print(f"{cfg}")
 
     results = []
 
     for mode in modes:
         for model_type, config in configs_to_run.items():
             for context_length in context_lengths:
-                print(f"Running {config['size']}, model [{mode}], context_length: {context_length}...")
+               logging.info(f"Running {config['size']} model, mode: [{mode}], context_length: {context_length}...")
 
                 model = BasicsTransformerLM(
                     vocab_size=vocab_size,
@@ -202,26 +207,39 @@ def main():
                     0, vocab_size, (batch_size, context_length), device=device
                 )
 
-                avg, std = benchmark(model, x, y, mode, model_type, context_length)
-                
-                print(f"  - {config['size']} [{mode}]: Avg Time = {avg:.6f}ms, Std Dev = {std:.6f}ms")
+                try:
+                    stats = benchmark(model, x, y, mode, model_type, context_length)
+                except torch.cuda.OutOfMemoryError as e:
+                    logging.error("Benchmark OOM for model %s, mode %s, context_length %s: %s", config['size'], mode, context_length, e)
+                    stats = {
+                        "mean_total": float('nan'),
+                        "std_total": float('nan'),
+                        "mean_forward": float('nan'),
+                        "std_forward": float('nan'),
+                        "mean_backward": float('nan'),
+                        "std_backward": float('nan'),
+                        "mean_loss": float('nan'),
+                        "std_loss": float('nan'),
+                        "mean_optimizer": float('nan'),
+                        "std_optimizer": float('nan'),
+                    }
+                logging.info(f"model {config['size']} [{mode}]: Avg Time = {stats['mean_total']:.6f}ms, Std Dev = {stats['std_total']:.6f}ms")
                 del model, x, y 
                 torch.cuda.empty_cache()
                 
-
                 results.append(
                     {
                         "model_size": config["size"],
                         "Mode": mode,
-                        "d_model": config["d_model"],
-                        "d_ff": config["d_ff"],
-                        "num_layers": config["num_layers"],
-                        "num_heads": config["num_heads"],
                         "Context Length": context_length,
-                        "Avg Time (ms)": round(avg, 6),
-                        "Std Dev (ms)": round(std, 6),
-                        "Warmup Steps": warmup_steps,
-                        "Benchmark Steps": benchmark_steps,
+                        "Avg Time (ms)": round(stats['mean_total'], 6),
+                        "Std Dev (ms)": round(stats['std_total'], 6),
+                        "Avg Forward (ms)": round(stats['mean_forward'], 6),
+                        "Std Dev Forward (ms)": round(stats['std_forward'], 6),
+                        "Avg Backward (ms)": round(stats['mean_backward'], 6),
+                        "Std Dev Backward (ms)": round(stats['std_backward'], 6),
+                        "Avg Optimizer (ms)": round(stats['mean_optimizer'], 6),
+                        "Std Dev Optimizer (ms)": round(stats['std_optimizer'], 6),
                     }
                 )
 
@@ -229,7 +247,7 @@ def main():
     # Output results
     df = pd.DataFrame(results)
     print(df.to_markdown(index=False))
-    save_file = f"benchmark_nvtx_results.md"
+    save_file = f"benchmark_nvtx_results_{model_name}_{mode_name}_{context_name}.md"
     # Save to file
     with open(save_file, "w") as f:
         f.write(df.to_markdown(index=False))

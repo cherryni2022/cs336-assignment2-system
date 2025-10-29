@@ -309,7 +309,7 @@ def main():
     logging.info("\nBenchmark Results:")
     df = pd.DataFrame(results)
     print(df.to_markdown(index=False))
-    save_file = f"benchmark_nvtx_results_{model_name}_{mode_name}_{context_name}.md"
+    save_file = f"benchmark_baseline_results_{model_name}_{mode_name}_{context_name}.md"
     # Save to file
     with open(save_file, "w") as f:
         f.write(df.to_markdown(index=False))
