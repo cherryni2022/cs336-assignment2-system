@@ -91,7 +91,6 @@ def benchmark(model, x, y, mode, model_type, context_length):
         optimizer_time = timeit.default_timer()
         optimizer_takes = (optimizer_time - backward_time) * 1000
         total_takes = (optimizer_time - start) * 1000
-        logging.info(f"mode {mode} total_takes: {total_takes} ms,forward_takes: {forward_takes} ms, loss_takes: {loss_takes} ms, backward_takes: {backward_takes} ms, optimizer_takes: {optimizer_takes} ms")
         return {
                 "total_takes": total_takes,
                 "forward_takes": forward_takes, 
@@ -133,7 +132,6 @@ def benchmark(model, x, y, mode, model_type, context_length):
             logging.error("train step_%s mode %s CUDA OOM: %s", step, mode, e)
             torch.cuda.empty_cache()
             raise
-        torch.cuda.synchronize()
         global_step += 1
         # take_time = (timeit.default_timer() - start) * 1000
         times.append(time_spend)
@@ -193,15 +191,18 @@ def main():
         benchmark_steps = args.benchmark_steps
     
     global context_lengths
+    context_name = "all"
     if args.context_length:
+        context_name = f"context_{args.context_length}"
         context_lengths = [args.context_length]
 
 
     configs_to_run = {}
-
+    model_name = "all"
     if args.all:
         configs_to_run = model_configs
     elif args.d_model and args.d_ff and args.num_layers and args.num_heads:
+        model_name = "custom"
         configs_to_run = {
             "custom":{
             "size": "custom",
@@ -214,12 +215,15 @@ def main():
         # 检查model_type是否存在于model_configs中
         if args.model_type not in model_configs:
             raise ValueError(f"Model type '{args.model_type}' not found in model_configs")
+        model_name = args.model_type
         model_config = model_configs[args.model_type]
-        configs_to_run = {args.model_type: model_configs[args.model_type]}
+        configs_to_run = {args.model_type: model_config}
     else:
         raise ValueError("Must specify either --all or all custom model hyperparameters.")
     
+    mode_name = "all"
     if args.mode:
+        mode_name = args.mode
         modes = [args.mode]
     else:
         modes = ["forward", "forward_backward"]
@@ -302,9 +306,10 @@ def main():
 
 
     # Output results
+    logging.info("\nBenchmark Results:")
     df = pd.DataFrame(results)
     print(df.to_markdown(index=False))
-    save_file = f"benchmark_nvtx_results.md"
+    save_file = f"benchmark_nvtx_results_{model_name}_{mode_name}_{context_name}.md"
     # Save to file
     with open(save_file, "w") as f:
         f.write(df.to_markdown(index=False))
