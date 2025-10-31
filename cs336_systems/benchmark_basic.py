@@ -45,8 +45,8 @@ warmup_steps = 5
 benchmark_steps = 10
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def benchmark(model, x, y, mode, model_type, context_length):
-    logging.info(f"start run model: {model_type}, mode: {mode}, context_length: {context_length}")
+def benchmark(model, x, y, mode, model_type, context_length, mixed_precision=False):
+    logging.info(f"start run model: {model_type}, mode: {mode}, context_length: {context_length}, mixed_precision: {mixed_precision}")
     model.train()
     #optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     optimizer = AdamW(model.parameters(), lr=1e-3)
@@ -57,8 +57,14 @@ def benchmark(model, x, y, mode, model_type, context_length):
     global_step = 0
     lossfn = torch.nn.CrossEntropyLoss()
 
-    #@nvtx.range(f"only forward_{model_type}_{context_length}")
+    ctx = (
+        torch.amp.autocast("cuda", dtype=torch.bfloat16)
+        if mixed_precision
+        else nullcontext()
+    )
+
     def step_forward():
+        
         with torch.no_grad():
             start = timeit.default_timer()
             _ = model(x)
@@ -109,7 +115,8 @@ def benchmark(model, x, y, mode, model_type, context_length):
         for group in optimizer.param_groups:
             group['lr'] = lr
         try:
-            time_spend = step_fn()
+            with ctx:
+                time_spend = step_fn()
         except torch.cuda.OutOfMemoryError as e:
             logging.error("warmup step_%s mode %s CUDA OOM: %s", warmup_step, mode, e)
             torch.cuda.empty_cache()
@@ -119,7 +126,7 @@ def benchmark(model, x, y, mode, model_type, context_length):
 
     # Timed steps
     times = []
-    logging.info(f"start benchmark model: {model_type}, mode: {mode}, context_length: {context_length} ================")
+    logging.info(f"start benchmark model: {model_type}, mode: {mode}, context_length: {context_length}, mixed_precision: {mixed_precision} ===============")
     #with nvtx.range(f"Training_{model_type}_{context_length}_{mode}"):
     for step in range(benchmark_steps):
         # start = timeit.default_timer()
@@ -127,7 +134,8 @@ def benchmark(model, x, y, mode, model_type, context_length):
         for group in optimizer.param_groups:
             group['lr'] = lr
         try:
-            time_spend = step_fn()
+            with ctx:
+                time_spend = step_fn()
         except torch.cuda.OutOfMemoryError as e:
             logging.error("train step_%s mode %s CUDA OOM: %s", step, mode, e)
             torch.cuda.empty_cache()
@@ -174,6 +182,7 @@ def parse_args():
     parser.add_argument("--model_type", type=str, help="Model type (small, medium, large, xl, 2.7B)")
     parser.add_argument("--context_length", type=int, help="Sequence context length")
     parser.add_argument("--mode", type=str, help="Benchmark mode: forward or forward_backward")
+    parser.add_argument("--mixed_precision", action="store_true", help="Enable mixed precision training")
     parser.add_argument("--warmup_steps", type=int, help="Number of warmup steps")
     parser.add_argument("--benchmark_steps", type=int, help="Number of benchmark steps")
     return parser.parse_args()
@@ -196,7 +205,7 @@ def main():
         context_name = f"context_{args.context_length}"
         context_lengths = [args.context_length]
 
-
+        
     configs_to_run = {}
     model_name = "all"
     if args.all:
@@ -228,9 +237,10 @@ def main():
     else:
         modes = ["forward", "forward_backward"]
 
-    logging.info("\nRunning the following configurations:")
+    logging.info(f"\nRunning the following model configurations, mode {mode_name},"
+                f" context length {context_name}, mix_presicion {args.mixed_precision}:")
     for cfg in configs_to_run:
-        logging.info(f"  - {cfg}")
+        logging.info(f"{cfg}")
     
 
     results = []
@@ -259,7 +269,7 @@ def main():
                 )
 
                 try:
-                    stats = benchmark(model, x, y, mode, model_type, context_length)
+                    stats = benchmark(model, x, y, mode, model_type, context_length, args.mixed_precision)
                 except torch.cuda.OutOfMemoryError as e:
                     logging.error("Benchmark OOM for model %s, mode %s, context_length %s: %s", config['size'], mode, context_length, e)
                     stats = {
@@ -284,10 +294,6 @@ def main():
                     {
                         "model_size": config["size"],
                         "Mode": mode,
-                        "d_model": config["d_model"],
-                        "d_ff": config["d_ff"],
-                        "num_layers": config["num_layers"],
-                        "num_heads": config["num_heads"],
                         "Context Length": context_length,
                         "Avg Time (ms)": round(stats['mean_total'], 6),
                         "Std Dev (ms)": round(stats['std_total'], 6),
@@ -299,8 +305,6 @@ def main():
                         "Std Dev Loss (ms)": round(stats['std_loss'], 6),
                         "Avg Optimizer (ms)": round(stats['mean_optimizer'], 6),
                         "Std Dev Optimizer (ms)": round(stats['std_optimizer'], 6),
-                        "Warmup Steps": warmup_steps,
-                        "Benchmark Steps": benchmark_steps,
                     }
                 )
 

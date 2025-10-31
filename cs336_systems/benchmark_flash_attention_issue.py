@@ -4,7 +4,11 @@ import pandas as pd
 from typing import Tuple
 import logging
 
-logging.basicConfig(level=logging.DEBUG, force=True)
+logging.basicConfig(
+    format="%(asctime)s - %(module)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
 torch._dynamo.config.verbose = True
 torch.autograd.set_detect_anomaly(True)
 torch._inductor.config.debug = True
@@ -48,18 +52,21 @@ def benchmark_configs():
     for dtype in dtypes:
         for seq_len in seq_lengths:
             if dtype == torch.float32 and seq_len == 65536:
+                logging.error(f"Skip seq_len={seq_len}, dim={dim}, dtype={dtype} due to memory constraints")
                 continue
 
             for dim in dims:
                 # Skip configurations that would exceed GPU memory
                 if seq_len * dim * (8 if dtype == torch.float32 else 4) > 2**31:
+                    logging.error(f"Skip seq_len={seq_len}, dim={dim}, dtype={dtype} due to memory constraints"
+                                    f",seq_len * dim * 8(or 4) > 2^31")
                     continue
 
-                print(f"Benchmarking seq_len={seq_len}, dim={dim}, dtype={dtype}")
+                logging.info(f"Benchmarking seq_len={seq_len}, dim={dim}, dtype={dtype}")
 
                 # Generate inputs
                 q, k, v, do = generate_inputs(1, seq_len, dim, dtype)
-                print("Generated inputs")
+                logging.info("Generated inputs")
 
                 # These are not actually being used
                 if seq_len <= 2048:
@@ -91,11 +98,10 @@ def benchmark_configs():
                     'triton_total_ms': triton_both,
                 })
 
-                print(f"pytorch_vanilla_attn: {pytorch_fwd} ms, {pytorch_bwd} ms, {pytorch_fwd + pytorch_bwd} ms")
-                print(f"triton_flash_attn: {triton_fwd} ms, {triton_bwd} ms, {triton_fwd + triton_bwd} ms")
+                logging.info(f"pytorch_vanilla_attn: {pytorch_fwd} ms, {pytorch_bwd} ms, {pytorch_fwd + pytorch_bwd} ms")
+                logging.info(f"triton_flash_attn: {triton_fwd} ms, {triton_bwd} ms, {triton_fwd + triton_bwd} ms")
 
                 torch.cuda.empty_cache()
-                print("Cleared GPU memory")
 
     # Create DataFrames and convert to LaTeX tables
     latex_tables = {}

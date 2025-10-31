@@ -44,10 +44,30 @@ benchmark_steps = 10
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-#cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+@nvtx.range("scaled dot product attention")
+def annotated_scaled_dot_product_attention(
+    Q: Float[Tensor, " ... queries d_k"],
+    K: Float[Tensor, " ... keys    d_k"],
+    V: Float[Tensor, " ... keys    d_v"],
+    mask: Bool[Tensor, " ... queries keys"] | None = None,
+) -> Float[Tensor, " ... queries d_v"]:
+    d_k = K.shape[-1]
+    with nvtx.range("computing attention scores"):
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
-def benchmark(model, x, y, mode, model_type, context_length):
-    logging.info(f"start run model: {model_type}, mode: {mode}, context_length: {context_length}")
+    if mask is not None:
+        attention_scores = torch.where(mask, attention_scores, float("-inf"))
+
+    with nvtx.range("computing softmax"):
+        attention_weights = torch.softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+
+    with nvtx.range("final matmul"):
+        output = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    return output
+
+def benchmark(model, x, y, mode, model_type, context_length, mixed_precision=False):
+    logging.info(f"start run model: {model_type}, mode: {mode}, context_length: {context_length}, mixed_precision: {mixed_precision}")
+    #cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
     model.train()
     #optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     optimizer = AdamW(model.parameters(), lr=1e-3)
@@ -57,14 +77,30 @@ def benchmark(model, x, y, mode, model_type, context_length):
     total_iters = warmup_steps + benchmark_steps
     global_step = 0
     lossfn = torch.nn.CrossEntropyLoss()
+    ctx = (
+        torch.amp.autocast("cuda", dtype=torch.bfloat16)
+        if mixed_precision
+        else nullcontext()
+    )
+
+    def warmup_forward():
+        with torch.no_grad():
+            _ = model(x)
+        
+    def warmup_forward_backward():
+        optimizer.zero_grad()
+        out = model(x)
+        loss = lossfn(out.view(-1, vocab_size), y.view(-1))
+        loss.backward()
+        optimizer.step()
 
     @nvtx.range(f"only forward_{model_type}_{context_length}")
-    def step_forward():
+    def train_forward():
         with torch.no_grad():
             _ = model(x)
 
     @nvtx.range(f"full forward + backward_{model_type}_{context_length}")
-    def step_forward_backward():
+    def train_forward_backward():
         optimizer.zero_grad()
         with nvtx.range(f"forward_{model_type}_{context_length}"):
             out = model(x)
@@ -75,8 +111,9 @@ def benchmark(model, x, y, mode, model_type, context_length):
         with nvtx.range(f"optimizer_{model_type}_{context_length}"):
             optimizer.step()
 
-    step_fn = step_forward if mode == "forward" else step_forward_backward
-
+    step_fn = train_forward if mode == "forward" else train_forward_backward
+    # 排除warmup的nvtx统计
+    warmup_fn = warmup_forward if mode == "forward" else warmup_forward_backward
     # Warm-up
     logging.info(f"start warmup model: {model_type}, mode: {mode}, context_length: {context_length} ===============")
     with nvtx.range(f"warmup_{model_type}_{context_length}_{mode}"):
@@ -86,14 +123,15 @@ def benchmark(model, x, y, mode, model_type, context_length):
                 group['lr'] = lr
             start = timeit.default_timer()
             try:
-                step_fn()
+                with ctx:
+                    warmup_fn()
             except torch.cuda.OutOfMemoryError as e:
                 logging.error("warmup step_%s mode %s CUDA OOM: %s", warmup_step, mode, e)
                 torch.cuda.empty_cache()
                 raise
             torch.cuda.synchronize()
             end = timeit.default_timer()
-            logging.info("warmup step_%s mode %s time_spend: %s", warmup_step, mode, {(end - start)*1000} ms)
+            logging.info("warmup step_%s mode %s time_spend: %s ms", warmup_step, mode, (end - start)*1000)
             global_step += 1
 
     # Timed steps
@@ -108,7 +146,8 @@ def benchmark(model, x, y, mode, model_type, context_length):
                 group['lr'] = lr
 
             try:
-                step_fn()
+                with ctx:
+                    step_fn()
             except torch.cuda.OutOfMemoryError as e:
                 logging.error("train step_%s mode %s CUDA OOM: %s", step, mode, e)
                 torch.cuda.empty_cache()
@@ -136,6 +175,7 @@ def parse_args():
     parser.add_argument("--model_type", type=str, help="Model type (small, medium, large, xl, 2.7B)")
     parser.add_argument("--context_length", type=int, help="Sequence context length")
     parser.add_argument("--mode", type=str, help="Benchmark mode: forward or forward_backward")
+    parser.add_argument("--mixed_precision", action="store_true", help="Enable mixed precision training")
     parser.add_argument("--warmup_steps", type=int, help="Number of warmup steps")
     parser.add_argument("--benchmark_steps", type=int, help="Number of benchmark steps")
     return parser.parse_args()
@@ -190,17 +230,17 @@ def main():
     else:
         modes = ["forward", "forward_backward"]
 
-    logging.info("\nRunning the following configurations:")
+    logging.info(f"\nRunning the following models, mode {mode_name},"
+                f" context length {context_name}, mixed precision {args.mixed_precision}:")
     for cfg in configs_to_run:
-        print(f"{cfg}")
+        logging.info(f"{cfg}")
 
     results = []
 
     for mode in modes:
         for model_type, config in configs_to_run.items():
             for context_length in context_lengths:
-               logging.info(f"Running {config['size']} model, mode: [{mode}], context_length: {context_length}...")
-
+                logging.info(f"Running {config['size']} model, mode: [{mode}], context_length: {context_length}...")
                 model = BasicsTransformerLM(
                     vocab_size=vocab_size,
                     context_length=context_length,
@@ -220,7 +260,7 @@ def main():
                 )
 
                 try:
-                    avg, std = benchmark(model, x, y, mode, model_type, context_length)
+                    avg, std = benchmark(model, x, y, mode, model_type, context_length, args.mixed_precision)
                 except torch.cuda.OutOfMemoryError as e:
                     logging.error("Benchmark OOM for model %s, mode %s, context_length %s: %s", config['size'], mode, context_length, e)
                     avg = float('nan')
@@ -245,6 +285,8 @@ def main():
     df = pd.DataFrame(results)
     print(df.to_markdown(index=False))
     save_file = f"benchmark_nvtx_results_{model_name}_{mode_name}_{context_name}.md"
+    if args.mixed_precision:
+        save_file = f"{save_file.split('.md')[0]}_mixed_precision.md"
     # Save to file
     with open(save_file, "w") as f:
         f.write(df.to_markdown(index=False))
