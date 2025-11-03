@@ -9,8 +9,11 @@ from torch import Tensor
 from jaxtyping import Float, Bool, Int
 from einops import rearrange, einsum
 import einx
-from cs336_basics.model import BasicsTransformerLM
+from einops import rearrange, reduce, einsum, repeat
+from cs336_basics.model import BasicsTransformerLM,scaled_dot_product_attention
 from cs336_basics.optimizer import AdamW, get_cosine_lr
+from contextlib import nullcontext
+import math
 import argparse
 import logging
 
@@ -64,10 +67,14 @@ def annotated_scaled_dot_product_attention(
     with nvtx.range("final matmul"):
         output = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
     return output
+# Use module-level monkey patch so that CausalMultiHeadSelfAttention in cs336_basics.model
+# calls our NVTX-annotated attention during forward.
+import cs336_basics.model as basics_model
+basics_model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 def benchmark(model, x, y, mode, model_type, context_length, mixed_precision=False):
+    # scaled_dot_product_attention = annotated_scaled_dot_product_attention  # ineffective local alias; removed
     logging.info(f"start run model: {model_type}, mode: {mode}, context_length: {context_length}, mixed_precision: {mixed_precision}")
-    #cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
     model.train()
     #optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     optimizer = AdamW(model.parameters(), lr=1e-3)
