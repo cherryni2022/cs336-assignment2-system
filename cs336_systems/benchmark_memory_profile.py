@@ -161,8 +161,19 @@ def benchmark(model, x, y, mode, model_type, context_length, mixed_precision=Fal
         
     is_mixed_precision_str = "bf16" if mixed_precision else "fp32"
     torch.cuda.memory._dump_snapshot(f"memory_snapshot_{model_type}_{context_length}_{mode}_{is_mixed_precision_str}.pickle")
-    #torch.cuda.memory._record_memory_history(enabled=None)
-    torch.cuda.memory._record_memory_history(enabled=True)
+    torch.cuda.memory._record_memory_history(enabled=False)
+
+    # ========= 打印峰值显存信息 =========
+    allocated = torch.cuda.memory_allocated() / 1024**2
+    allocated_GB = torch.cuda.memory_allocated() / 1024**3
+    max_allocated = torch.cuda.max_memory_allocated() / 1024**2
+    max_allocated_GB = torch.cuda.max_memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**2
+    reserved_GB = torch.cuda.memory_reserved() / 1024**3
+    logging.info(f"benchmark model_{model_type},mode_{mode},context_length_{context_length}"
+                 f"GPU Allocated: {allocated:.1f} MB ({allocated_GB:.3f} GB), "
+                 f"Max Allocated: {max_allocated:.1f} MB ({max_allocated_GB:.3f} GB), "
+                 f"Reserved: {reserved:.1f} MB ({reserved_GB:.3f} GB)")
     logging.info(f"benchmark model_{model_type},mode_{mode},context_length_{context_length} mean time: {mean(times)} ms, std time: {stdev(times)} ms")
     return mean(times), stdev(times)
 
