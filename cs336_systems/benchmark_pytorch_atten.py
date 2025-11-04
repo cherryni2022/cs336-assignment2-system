@@ -6,9 +6,11 @@ from torch import Tensor
 from jaxtyping import Float, Bool, Int
 from einops import rearrange, einsum
 import einx
+import math
 import pandas as pd
 from statistics import mean, stdev
 from cs336_basics.model import BasicsTransformerLM
+from contextlib import nullcontext
 import argparse
 from itertools import product
 import logging
@@ -22,10 +24,12 @@ logging.basicConfig(
 batch_size = 8
 d_model_params = [16, 32, 64, 128]
 seq_len_params = [256, 1024, 4096, 8192, 16384]
+# for test
+# d_model_params = [128]
+# seq_len_params = [256, 1024, 4096]
 forward_times = 100
 backward_times = 100
 vocab_size = 10_000
-test_context_lengths = [128, 256, 512, 1024]
 rope_theta = 10000.0
 warmup_steps = 5
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -69,7 +73,7 @@ def create_random_input(batch_size, d_model, seq_len):
 # g.测量在后向传播开始前使用了多少内存，并计时 100 次后向传播。
 # h.确保进行了预热，并在每次前向/后向传播后调用 torch.cuda.synchronize()。
 
-def benchmark_attention(d_model, context_length):
+def benchmark_attention(d_model, context_length, mixed_precision=False):
     """
     对注意力机制进行基准测试
     warmup + 100 times forward pass,
@@ -84,6 +88,11 @@ def benchmark_attention(d_model, context_length):
     Q, K, V = create_random_input(batch_size, d_model, context_length)
 
     compiled_attention = torch.compile(scaled_dot_product_attention)
+    ctx = (
+        torch.amp.autocast("cuda", dtype=torch.bfloat16)
+        if mixed_precision
+        else nullcontext()
+    )
 
     def step_forward():
         """执行前向传播"""
@@ -104,25 +113,36 @@ def benchmark_attention(d_model, context_length):
     
     # 预热阶段
     logging.info(f"warmup forward pass...")
-    for _ in range(warmup_steps):
-        step_forward()
-    torch.cuda.synchronize()
+    try:
+        for _ in range(warmup_steps):
+            with ctx:
+                step_forward()
+        torch.cuda.synchronize()
+    except torch.cuda.OutOfMemoryError as e:
+            logging.error("d_model=%s, context_length=%s, forward warmup CUDA OOM: %s", d_model, context_length, e)
+            torch.cuda.empty_cache()
+            raise
     
     # === forward pass ===
     logging.info(f"start run forward pass {forward_times} times...")
-    # 清理缓存并记录初始内存
-    torch.cuda.empty_cache()
+    
     torch.cuda.reset_peak_memory_stats()  # 重置峰值内存统计
     initial_memory = torch.cuda.memory_allocated() / 1024 / 1024  # MB
     
     # forward timing
     forward_times_list = []
-    for i in range(forward_times):
-        start_time = timeit.default_timer()
-        step_forward()
-        torch.cuda.synchronize()
-        end_time = timeit.default_timer()
-        forward_times_list.append(end_time - start_time)
+    try:
+        for i in range(forward_times):
+            start_time = timeit.default_timer()
+            with ctx:
+                step_forward()
+            torch.cuda.synchronize()
+            end_time = timeit.default_timer()
+            forward_times_list.append(end_time - start_time)
+    except torch.cuda.OutOfMemoryError as e:
+            logging.error("d_model=%s, context_length=%s, forward pass CUDA OOM: %s", d_model, context_length, e)
+            torch.cuda.empty_cache()
+            raise
     
     # record forward peak memory
     forward_peak_memory = torch.cuda.max_memory_allocated() / (1024**2)  # MB
@@ -131,6 +151,7 @@ def benchmark_attention(d_model, context_length):
     forward_std_time = stdev(forward_times_list)*1000
     logging.info(f"[test case] forward pass d_model: {d_model}, context_length:{context_length}"
                  f", peak memory: {forward_peak_memory:.1f} MB, {forward_peak_memory/1024:.3f} GB"
+                 f", initial_memory: {initial_memory:.1f} MB, {initial_memory/1024:.3f} GB"
                  f", memory used: {forward_memory_used:.1f} MB, {forward_memory_used/1024:.3f} GB"
                  f", avg_time: {forward_avg_time:.3f} ms"
                  f", std_time: {forward_std_time:.3f} ms")
@@ -141,25 +162,37 @@ def benchmark_attention(d_model, context_length):
     K.requires_grad_(True) 
     V.requires_grad_(True)
     
-    for _ in range(warmup_steps):
-        step_backward()
-
-    torch.cuda.synchronize()
+    # === Backward pass ===
+    logging.info(f"warmup backward pass...")
+    try:
+        for _ in range(warmup_steps):
+            with ctx:
+                step_backward()
+        torch.cuda.synchronize()
+    except torch.cuda.OutOfMemoryError as e:
+            logging.error("d_model=%s, context_length=%s, backward warmup CUDA OOM: %s", d_model, context_length, e)
+            torch.cuda.empty_cache()
+            raise
+    
 
     logging.info(f"start run backward pass {backward_times} times...")
-    # 清理缓存并重置峰值内存统计
-    torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     initial_memory_backward = torch.cuda.memory_allocated() / 1024 / 1024  # MB
 
     # Backward计时阶段
     backward_times_list = []
-    for i in range(backward_times):
-        start = timeit.default_timer()
-        step_backward()
-        torch.cuda.synchronize()
-        end_time = timeit.default_timer()
-        backward_times_list.append(end_time - start_time)
+    try:
+        for i in range(backward_times):
+            start_time = timeit.default_timer()
+            with ctx:
+                step_backward()
+            torch.cuda.synchronize()
+            end_time = timeit.default_timer()
+            backward_times_list.append(end_time - start_time)
+    except torch.cuda.OutOfMemoryError as e:
+            logging.error("d_model=%s, context_length=%s, backward pass CUDA OOM: %s", d_model, context_length, e)
+            torch.cuda.empty_cache()
+            raise
     
     # 记录backward阶段的峰值内存使用
     backward_peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024  # MB
@@ -168,6 +201,7 @@ def benchmark_attention(d_model, context_length):
     backward_std_time = stdev(backward_times_list)*1000
     logging.info(f"[test case] backward pass d_model: {d_model}, context_length:{context_length}"
                  f", peak memory: {backward_peak_memory:.1f} MB, {backward_peak_memory/1024:.3f} GB"
+                 f", initial_memory: {initial_memory_backward:.1f} MB, {initial_memory_backward/1024:.3f} GB"
                  f", memory used: {backward_memory_used:.1f} MB, {backward_memory_used/1024:.3f} GB"
                  f", avg_time: {backward_avg_time:.3f} ms"
                  f", std_time: {backward_std_time:.3f} ms")
@@ -175,10 +209,8 @@ def benchmark_attention(d_model, context_length):
     return {
         "d_model": d_model,
         "seq_len": context_length,
-        "forward_avg_time(ms)": forward_avg_time,
-        "forward_std_time(ms)": forward_std_time,
-        "backward_avg_time(ms)": backward_avg_time,
-        "backward_std_time(ms)": backward_std_time,
+        "forward_avg_time(ms)": round(forward_avg_time, 3),
+        "backward_avg_time(ms)": round(backward_avg_time, 3),
         "forward_peak_memory(GB)": forward_peak_memory/1024,
         "backward_peak_memory(GB)":backward_peak_memory/1024,
         "forward_memory_used(GB)":forward_memory_used/1024,
@@ -187,32 +219,41 @@ def benchmark_attention(d_model, context_length):
     }
     
 def main():
-    
+    parser = argparse.ArgumentParser(description="Benchmark attention.")
+    parser.add_argument("--mixed_precision", action="store_true", default=False, help="Enable mixed precision training")
+    args = parser.parse_args()
+
     logging.info(f"start benchmark attention, d_models: {d_model_params},"
-                f"context_length: {seq_len_params}")
+                f"context_length: {seq_len_params}, mixed_precision: {args.mixed_precision}")
     results = []
-    
+
     for d_model, context_length in product(d_model_params, seq_len_params):
-        logging.info(f"start test case: d_model={d_model}, context_length={context_length}")
+        logging.info(f"start benchmark case: d_model={d_model}, context_length={context_length}")
         
         # 执行基准测试（包含forward和backward）
         try:
-            #benchmark_attention(d_model, seq_len)
-            result = benchmark_attention(Q, K, V)
+            result = benchmark_attention(d_model, context_length)
             results.append(result)
         except RuntimeError as e:
+            logging.error(f"RuntimeError: {e}")
             if "out of memory" in str(e).lower():
                 mem_atten = batch_size * seq_len * seq_len * 4/(1024**3)
                 mem_total = mem_atten + (3 * batch_size * seq_len * d_model * 4)/(1024**3)
-                results.append({
-                "d_model": d_model,
-                "seq_len": context_length,
-                "forward_time(ms)": "OOM",
-                "backward_time(ms)": "OOM",
-                "memory_before_backward(GB)": "OOM",
-                "memory_in_backward(GB)":"OOM",
-                "status": "OOM"
-            })
+                logging.info(f"benchmark case OOM d_model={d_model}, context_length={context_length}, "
+                            f"required mem_atten:{mem_atten:.3f} GB, mem_total: {mem_total:.3f} GB")
+                results.append(
+                {
+                    "d_model": d_model,
+                    "seq_len": context_length,
+                    "forward_avg_time(ms)": "OOM",
+                    "backward_avg_time(ms)": "OOM",
+                    "forward_peak_memory(GB)": "OOM",
+                    "backward_peak_memory(GB)": "OOM",
+                    "forward_memory_used(GB)": "OOM",
+                    "backward_memory_used(GB)": "OOM",
+                    "status": "OOM"
+                }
+                )
                 torch.cuda.empty_cache()
                 continue
             else:

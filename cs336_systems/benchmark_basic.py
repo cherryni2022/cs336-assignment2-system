@@ -11,6 +11,7 @@ from einops import rearrange, einsum
 import einx
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW, get_cosine_lr
+from contextlib import nullcontext
 import argparse
 import logging
 
