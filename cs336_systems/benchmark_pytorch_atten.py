@@ -211,10 +211,10 @@ def benchmark_attention(d_model, context_length, mixed_precision=False):
         "seq_len": context_length,
         "forward_avg_time(ms)": round(forward_avg_time, 3),
         "backward_avg_time(ms)": round(backward_avg_time, 3),
-        "forward_peak_memory(GB)": forward_peak_memory/1024,
-        "backward_peak_memory(GB)":backward_peak_memory/1024,
-        "forward_memory_used(GB)":forward_memory_used/1024,
-        "backward_memory_used(GB)":backward_memory_used/1024,
+        "forward_peak_memory(GB)": round(forward_peak_memory/1024, 3),
+        "backward_peak_memory(GB)": round(backward_peak_memory/1024, 3),
+        "forward_memory_used(GB)": round(forward_memory_used/1024, 3),
+        "backward_memory_used(GB)": round(backward_memory_used/1024, 3),
         "status": "Success"
     }
     
@@ -263,8 +263,11 @@ def main():
     
     # 保存结果到CSV
     df = pd.DataFrame(results)
-    df.to_csv('attention_benchmark_results.csv', index=False)
-    logging.info(f"finish benchmark attention, save result to attention_benchmark_results.csv")
+    print(df.to_markdown(index=False))
+    save_file = f"attention_benchmark_results_{'bf16' if args.mixed_precision else 'fp32'}.md"
+    with open(save_file, "w") as f:
+        f.write(df.to_markdown(index=False))
+    logging.info(f"finish benchmark attention, save result to {save_file}")
     print(df)
 
 if __name__ == "__main__":
