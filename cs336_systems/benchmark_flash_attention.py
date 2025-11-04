@@ -1,8 +1,12 @@
 import torch
+import torch.cuda.nvtx as nvtx
 import triton
 import pandas as pd
 from typing import Tuple
 import logging
+import argparse
+import math
+from itertools import product
 
 logging.basicConfig(
     format="%(asctime)s - %(module)s - %(levelname)s - %(message)s",
@@ -25,7 +29,8 @@ def generate_inputs(batch_size: int, context_length: int, d_model: int, dtype: t
     do = torch.randn(batch_size, context_length, d_model, device=device, dtype=dtype)
     return q, k, v, do
 
-def flash_attn_triton_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
+def flash_attn_triton_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+                        is_causal: bool = True, context_length=None, d_model=None, dtype=None) -> torch.Tensor:
     with nvtx.range(f"triton_fwd_pass_{context_length}_{d_model}_{dtype}"):
         out = FlashAttentionTritonImpl.apply(q, k, v, is_causal)
     return out
@@ -64,69 +69,108 @@ def benchmark_flash_attn(context_lengths, d_models, dtypes):
     results_by_dtype = {dtype: [] for dtype in dtypes}
 
     for dtype in dtypes:
-        for context_length in context_lengths:
-            # if dtype == torch.float32 and context_length == 65536:
-            #     logging.error(f"Skip context_length={context_length}, dtype={dtype} due to memory constraints")
+        for d_model, context_length in product(d_models, context_lengths):
+        # for context_length in context_lengths:
+        #     # if dtype == torch.float32 and context_length == 65536:
+        #     #     logging.error(f"Skip context_length={context_length}, dtype={dtype} due to memory constraints")
+        #     #     continue
+
+        #     for d_model in d_models:
+            # Skip configurations that would exceed GPU memory
+            # if context_length * d_model * (4 if dtype == torch.float32 else 2) > 2**31:
+            #     logging.error(f"Skip context_length={context_length}, d_model={d_model}, dtype={dtype} due to memory constraints"
+            #                     f",context_length * d_model * 4(or 2) > 2^31")
             #     continue
 
-            for d_model in d_models:
-                # Skip configurations that would exceed GPU memory
-                if context_length * d_model * (4 if dtype == torch.float32 else 2) > 2**31:
-                    logging.error(f"Skip context_length={context_length}, d_model={d_model}, dtype={dtype} due to memory constraints"
-                                    f",context_length * d_model * 4(or 2) > 2^31")
-                    continue
+            logging.info(f"start benchmarking dtype={dtype}, context_length={context_length}, d_model={d_model}")
+            # These are not actually being used
+            if context_length <= 2048:
+                q_tile_size = 64
+                k_tile_size = 64
+            elif context_length <= 8192:
+                q_tile_size = 32
+                k_tile_size = 32
+            else:
+                q_tile_size = 16
+                k_tile_size = 16
 
-                logging.info(f"Benchmarking context_length={context_length}, d_model={d_model}, dtype={dtype}")
+            # Benchmark regular pytorch attention
+            q, k, v, do = generate_inputs(1, context_length, d_model, dtype)
+            # 1.benchmark pytorch regular attention forward pass
+            try:
+                regular_attn_fwd_time = triton.testing.do_bench(lambda: pytorch_regular_attn_fwd(q, k, v, False, context_length, d_model, dtype))
+                logging.info(
+                    f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
+                    f", pytorch_regular_attn_fwd forward pass regular_attn_fwd_time: {regular_attn_fwd_time:.2f} ms")
+            except Exception as e:
+                logging.error(
+                    f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
+                    f", Exception in pytorch_regular_attn_fwd: {e}")
 
-                
-                # These are not actually being used
-                if seq_len <= 2048:
-                    q_tile_size = 64
-                    k_tile_size = 64
-                elif seq_len <= 8192:
-                    q_tile_size = 32
-                    k_tile_size = 32
-                else:
-                    q_tile_size = 16
-                    k_tile_size = 16
-
-                # Benchmark regular pytorch attention
-                q, k, v, do = generate_inputs(1, context_length, d_model, dtype)
-                # 1.benchmark pytorch regular attention forward pass
-                regular_attn_fwd_time = triton.testing.do_bench(lambda: pytorch_regular_attn_fwd(q, k, v, False))
-                # 2.benchmark pytorch regular attention forward+backward pass
+            # 2.benchmark pytorch regular attention forward+backward pass
+            try:
                 q.requires_grad_(True)
                 k.requires_grad_(True)
                 v.requires_grad_(True)
-                regular_attn_full_time = triton.testing.do_bench(lambda: (pytorch_regular_attn_bwd(q, k, v, False, do), torch.cuda.synchronize()))
+                regular_attn_full_time = triton.testing.do_bench(lambda: (pytorch_regular_attn_bwd(q, k, v, False, do, context_length, d_model, dtype), torch.cuda.synchronize()))
                 regular_attn_bwd_time = regular_attn_full_time - regular_attn_fwd_time
+                logging.info(
+                    f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
+                    f", pytorch_regular_attn_bwd full pass: "
+                    f" regular_attn_fwd_time:{regular_attn_fwd_time:.2f} ms"
+                    f", regular_attn_bwd_time:{regular_attn_bwd_time:.2f} ms"
+                    f", regular_attn_full_time:{regular_attn_full_time:.2f} ms")
+            except Exception as e:
+                logging.error(
+                    f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
+                    f", Exception in pytorch_regular_attn_bwd: {e}")
+            
 
 
-                # Benchmark partial Triton
-                # 3.benchmark triton flash attention forward pass
-                q, k, v, do = generate_inputs(1, context_length, d_model, dtype)
-                triton_fwd_time = triton.testing.do_bench(lambda: flash_attn_triton_fwd(q, k, v, False))
-                # 4.benchmark triton flash attention forward+backward pass
+            # Benchmark partial Triton
+            # 3.benchmark triton flash attention forward pass
+            q, k, v, do = generate_inputs(1, context_length, d_model, dtype)
+            try:
+                triton_fwd_time = triton.testing.do_bench(lambda: flash_attn_triton_fwd(q, k, v, False, context_length, d_model, dtype))
+                logging.info(
+                    f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
+                    f", triton_flash_attn_fwd forward pass triton_fwd_time: {triton_fwd_time:.2f} ms")
+            except Exception as e:
+                logging.error(
+                    f"benchmarking dtype={dtype}, context_length={context_length}, d_model={d_model}"
+                    f", Exception in flash_attn_triton_fwd: {e}")
+                continue
+            # 4.benchmark triton flash attention forward+backward pass
+            try:
                 q.requires_grad_(True)
                 k.requires_grad_(True)
                 v.requires_grad_(True)
-                flash_attn_full_time = triton.testing.do_bench(lambda: (flash_attn_bwd(q, k, v, False, do), torch.cuda.synchronize()))
+                flash_attn_full_time = triton.testing.do_bench(lambda: (flash_attn_bwd(q, k, v, False, do, context_length, d_model, dtype), torch.cuda.synchronize()))
                 flash_attn_bwd_time = flash_attn_full_time - triton_fwd_time
-                results_by_dtype[dtype].append({
-                    'context_length': context_length,
-                    'd_model': d_model,
-                    'regular_attn_forward_ms': regular_attn_fwd_time,
-                    'regular_attn_backward_ms': regular_attn_bwd_time,
-                    'regular_attn_total_ms': regular_attn_full_time,
-                    'flash_attn_triton_forward_ms': triton_fwd_time,
-                    'flash_attn_backward_ms': flash_attn_bwd_time,
-                    'triton_total_ms': flash_attn_full_time,
-                })
+                logging.info(
+                    f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
+                    f", flash_attn_bwd full pass "
+                    f", triton_fwd_time:{triton_fwd_time:.2f} ms"
+                    f", flash_attn_bwd_time:{flash_attn_bwd_time:.2f} ms"
+                    f", flash_attn_full_time:{flash_attn_full_time:.2f} ms")
+            except Exception as e:
+                logging.error(
+                    f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
+                    f", Exception in flash_attn_bwd full pass: {e}")
+                continue
+            
+            results_by_dtype[dtype].append({
+                'context_length': context_length,
+                'd_model': d_model,
+                'regular_attn_forward_ms': round(regular_attn_fwd_time, 2),
+                'regular_attn_backward_ms': round(regular_attn_bwd_time, 2),
+                'regular_attn_total_ms': round(regular_attn_full_time, 2),
+                'flash_attn_triton_forward_ms': round(triton_fwd_time, 2),
+                'flash_attn_backward_ms': round(flash_attn_bwd_time, 2),
+                'triton_total_ms': round(flash_attn_full_time, 2),
+            })
 
-                logging.info(f"pytorch_regular_attn: {regular_attn_fwd_time} ms, {regular_attn_bwd_time} ms, {regular_attn_full_time} ms")
-                logging.info(f"triton_flash_attn: {triton_fwd_time} ms, {flash_attn_bwd_time} ms, {flash_attn_full_time} ms")   
-
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
     # Create DataFrames and convert to LaTeX tables
     latex_tables = {}
@@ -155,7 +199,7 @@ def main():
     args = parse_args()
     if args.d_model:
             # 将输入的字符串按逗号分割并转换为整数列表
-        test_d_models = [int(x) for x in args.d_model.split(',')]
+        test_d_models = [args.d_model]
     else:
         test_d_models = d_models
 
