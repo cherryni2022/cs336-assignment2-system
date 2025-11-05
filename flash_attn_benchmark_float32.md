@@ -1,0 +1,3 @@
+|   context_length |   d_model |   regular_attn_forward_ms |   regular_attn_backward_ms |   regular_attn_total_ms |   flash_attn_triton_forward_ms |   flash_attn_backward_ms |   triton_total_ms |
+|-----------------:|----------:|--------------------------:|---------------------------:|------------------------:|-------------------------------:|-------------------------:|------------------:|
+|              128 |       128 |                       0.1 |                       3.46 |                    3.56 |                           0.06 |                     0.99 |              1.05 |
