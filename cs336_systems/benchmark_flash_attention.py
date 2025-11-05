@@ -13,9 +13,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-torch._dynamo.config.verbose = True
-torch.autograd.set_detect_anomaly(True)
-torch._inductor.config.debug = True
+# torch._dynamo.config.verbose = True
+# torch.autograd.set_detect_anomaly(True)
+# torch._inductor.config.debug = True
 
 #from cs336_systems.flash_atten.flash_attention import TritonFlashAttention2
 from cs336_systems.flash_atten.flash_atten_triton import FlashAttentionTritonImpl
@@ -145,6 +145,15 @@ def benchmark_flash_attn(context_lengths, d_models, dtypes):
                 q.requires_grad_(True)
                 k.requires_grad_(True)
                 v.requires_grad_(True)
+                #warmup for backward: compile 耗时
+                for _ in range(3):
+                    start_time = timeit.default_timer()
+                    flash_attn_bwd(q, k, v, False, do, context_length, d_model, dtype)
+                    end_time = timeit.default_timer()
+                    logging.info(f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
+                        f", warmup flash_attn_bwd {_} time: {(end_time - start_time)*1000:.2f} ms")
+                torch.cuda.synchronize()
+
                 flash_attn_full_time = triton.testing.do_bench(lambda: (flash_attn_bwd(q, k, v, False, do, context_length, d_model, dtype), torch.cuda.synchronize()))
                 flash_attn_bwd_time = flash_attn_full_time - triton_fwd_time
                 logging.info(

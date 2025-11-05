@@ -107,7 +107,8 @@ def _flash_attention_backward_compiled(
     dQ = torch.zeros_like(Q)
     dK = torch.zeros_like(K)
     dV = torch.zeros_like(V)
-    scale = d_head ** -0.5
+    # scale = d_head ** -0.5
+    scale = 1.0 / math.sqrt(d_head)
     D = torch.sum(grad_O * O, dim=-1)
 
     T_q = math.ceil(N_q / B_q)
@@ -168,17 +169,38 @@ class FlashAttentionTritonImpl(torch.autograd.Function):
         return O
 
     @staticmethod
-    def backward(ctx, grad_output):
-        Q, K, V, O, L = ctx.saved_tensors
-        is_causal = ctx.is_causal
-        batch_size, q_len, head_dim = Q.shape
-        _, N_k, _ = K.shape
+    @torch.compile(fullgraph=True)
+    def backward(ctx, dO):
+        O, L, Q, K, V = ctx.saved_tensors
+        d = K.shape[-1]
+        S = einsum(Q, K, "b s1 d, b s2 d->b s1 s2")/d**0.5
+        if ctx.is_causal:
+            mask = torch.tril(torch.ones(S.shape[-2], S.shape[-1], device=S.device)) # 下三角为1
+            S = S.masked_fill(mask==0, -torch.inf)
+        P = torch.exp(S - L.unsqueeze(-1))
+        dV = einsum(P, dO, 'b s1 s2, b s1 d->b s2 d')
+        dP = einsum(V, dO, 'b s2 d, b s1 d->b s1 s2')
 
-        B_q, B_k = 64, 64
+        D = (O * dO).sum(dim=-1)
+        dS = P * (dP - D.unsqueeze(-1))
 
-        dQ, dK, dV = _flash_attention_backward_compiled(
-            Q, K, V, O, L, grad_output, is_causal,
-            batch_size, q_len, N_k, head_dim,
-            B_q, B_k
-        )
+        dQ = einsum(dS, K, 'b s1 s2, b s2 d->b s1 d')/d**0.5
+        dK = einsum(dS, Q, 'b s1 s2, b s1 d->b s2 d')/d**0.5
+
         return dQ, dK, dV, None
+
+    # @staticmethod
+    # def backward(ctx, grad_output):
+        # Q, K, V, O, L = ctx.saved_tensors
+        # is_causal = ctx.is_causal
+        # batch_size, q_len, head_dim = Q.shape
+        # _, N_k, _ = K.shape
+
+        # B_q, B_k = 64, 64
+
+        # dQ, dK, dV = _flash_attention_backward_compiled(
+        #     Q, K, V, O, L, grad_output, is_causal,
+        #     batch_size, q_len, N_k, head_dim,
+        #     B_q, B_k
+        # )
+        # return dQ, dK, dV, None
