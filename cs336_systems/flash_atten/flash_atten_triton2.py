@@ -98,48 +98,6 @@ def flash_atten_fwd_kernel(
     L_i = m_i + tl.log(l_i)
     tl.store(L_block_ptr, L_i.to(L_ptr.type.element_ty), boundary_check=(0,))
     
-# -------------------------------
-# Backward Pass (PyTorch)
-# -------------------------------
-@torch.compile(fullgraph=True)
-def _flash_attention_backward_compiled(
-    Q, K, V, O, L, grad_O, is_causal,
-    batch_size, N_q, N_k, d_head,
-    B_q, B_k
-):
-    dQ = torch.zeros_like(Q)
-    dK = torch.zeros_like(K)
-    dV = torch.zeros_like(V)
-    # scale = d_head ** -0.5
-    scale = 1.0 / math.sqrt(d_head)
-    D = torch.sum(grad_O * O, dim=-1)
-
-    T_q = math.ceil(N_q / B_q)
-    T_k = math.ceil(N_k / B_k)
-
-    for b in range(batch_size):
-        for i in range(T_q):
-            q_start, q_end = i * B_q, min((i + 1) * B_q, N_q)
-            Q_i, dO_i, L_i, D_i = Q[b, q_start:q_end], grad_O[b, q_start:q_end], L[b, q_start:q_end], D[b, q_start:q_end]
-            for j in range(T_k):
-                k_start, k_end = j * B_k, min((j + 1) * B_k, N_k)
-                K_j, V_j = K[b, k_start:k_end], V[b, k_start:k_end]
-                S_ij = (Q_i @ K_j.T) * scale
-
-                if is_causal:
-                    q_indices = torch.arange(q_start, q_end, device=Q.device)
-                    k_indices = torch.arange(k_start, k_end, device=K.device)
-                    causal_mask = q_indices[:, None] >= k_indices[None, :]
-                    S_ij = torch.where(causal_mask, S_ij, -float('inf'))
-
-                P_ij = torch.exp(S_ij - L_i.unsqueeze(1))
-                dV[b, k_start:k_end] += P_ij.T @ dO_i
-                dP_ij = dO_i @ V_j.T
-                dS_ij = P_ij * (dP_ij - D_i.unsqueeze(1))
-                dQ[b, q_start:q_end] += (dS_ij * scale) @ K_j
-                dK[b, k_start:k_end] += (dS_ij * scale).T @ Q_i
-
-    return dQ, dK, dV
 
 # -------------------------------
 # Backward Pass v2 (Triton Kernel)
@@ -327,27 +285,6 @@ class FlashAttentionTritonImpl(torch.autograd.Function):
         return O
 
     @staticmethod
-    @torch.compile(fullgraph=True)
-    def backward1(ctx, dO):
-        Q, K, V, O, L = ctx.saved_tensors
-        d = K.shape[-1]
-        S = einsum(Q, K, "b s1 d, b s2 d->b s1 s2")/d**0.5
-        if ctx.is_causal:
-            mask = torch.tril(torch.ones(S.shape[-2], S.shape[-1], device=S.device)) # 下三角为1
-            S = S.masked_fill(mask==0, -torch.inf)
-        P = torch.exp(S - L.unsqueeze(-1))
-        dV = einsum(P, dO, 'b s1 s2, b s1 d->b s2 d')
-        dP = einsum(V, dO, 'b s2 d, b s1 d->b s1 s2')
-
-        D = (O * dO).sum(dim=-1)
-        dS = P * (dP - D.unsqueeze(-1))
-
-        dQ = einsum(dS, K, 'b s1 s2, b s2 d->b s1 d')/d**0.5
-        dK = einsum(dS, Q, 'b s1 s2, b s1 d->b s2 d')/d**0.5
-
-        return dQ, dK, dV, None
-
-    @staticmethod
     def backward(ctx, dO):
         """
         Triton实现的Flash Attention反向传播（backward2）。
@@ -395,19 +332,4 @@ class FlashAttentionTritonImpl(torch.autograd.Function):
         )
 
         return dQ, dK, dV, None
-    # @staticmethod
-    # def backward(ctx, grad_output):
-        # Q, K, V, O, L = ctx.saved_tensors
-        # is_causal = ctx.is_causal
-        # batch_size, q_len, head_dim = Q.shape
-        # _, N_k, _ = K.shape
-
-        # B_q, B_k = 64, 64
-
-        # dQ, dK, dV = _flash_attention_backward_compiled(
-        #     Q, K, V, O, L, grad_output, is_causal,
-        #     batch_size, q_len, N_k, head_dim,
-        #     B_q, B_k
-        # )
-        # return dQ, dK, dV, None
-
+    

@@ -100,6 +100,11 @@ def benchmark_flash_attn(context_lengths, d_models, dtypes):
             triton_fwd_time = 0
             flash_attn_bwd_time = 0
             flash_attn_full_time = 0
+            # 初始化 warmup 变量，避免异常时未定义
+            warmup_regular_attn_fwd_time = 0
+            warmup_regular_attn_full_time = 0
+            warmup_flash_attn_fwd_time = 0
+            warmup_flash_attn_full_time = 0
             # Benchmark regular pytorch attention
             q, k, v, do = generate_inputs(1, context_length, d_model, dtype)
             # 1.benchmark pytorch regular attention forward pass
@@ -108,8 +113,9 @@ def benchmark_flash_attn(context_lengths, d_models, dtypes):
                 start_time = timeit.default_timer()
                 pytorch_regular_attn_fwd(q, k, v, False, context_length, d_model, dtype)
                 end_time = timeit.default_timer()
+                warmup_regular_attn_fwd_time = (end_time - start_time)*1000
                 logging.info(f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
-                    f", warmup pytorch_regular_attn_fwd time: {(end_time - start_time)*1000:.2f} ms")
+                    f", warmup pytorch_regular_attn_fwd time: {warmup_regular_attn_fwd_time:.2f} ms")
                 torch.cuda.synchronize()
 
                 regular_attn_fwd_time = triton.testing.do_bench(lambda: pytorch_regular_attn_fwd(q, k, v, False, context_length, d_model, dtype))
@@ -131,8 +137,9 @@ def benchmark_flash_attn(context_lengths, d_models, dtypes):
                 start_time = timeit.default_timer()
                 pytorch_regular_attn_bwd(q, k, v, False, do, context_length, d_model, dtype)
                 end_time = timeit.default_timer()
+                warmup_regular_attn_full_time = (end_time - start_time)*1000
                 logging.info(f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
-                    f", warmup pytorch_regular_attn_bwd time: {(end_time - start_time)*1000:.2f} ms")
+                    f", warmup pytorch_regular_attn_bwd time: {warmup_regular_attn_full_time:.2f} ms")
                 torch.cuda.synchronize()
 
                 regular_attn_full_time = triton.testing.do_bench(lambda: (pytorch_regular_attn_bwd(q, k, v, False, do, context_length, d_model, dtype), torch.cuda.synchronize()))
@@ -159,8 +166,9 @@ def benchmark_flash_attn(context_lengths, d_models, dtypes):
                 start_time = timeit.default_timer()
                 flash_attn_triton_fwd(q, k, v, False, context_length, d_model, dtype)
                 end_time = timeit.default_timer()
+                warmup_flash_attn_fwd_time = (end_time - start_time)*1000
                 logging.info(f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
-                    f", warmup flash_attn_triton_fwd time: {(end_time - start_time)*1000:.2f} ms")
+                    f", warmup flash_attn_triton_fwd time: {warmup_flash_attn_fwd_time:.2f} ms")
                 torch.cuda.synchronize()
 
                 triton_fwd_time = triton.testing.do_bench(lambda: flash_attn_triton_fwd(q, k, v, False, context_length, d_model, dtype))
@@ -181,8 +189,9 @@ def benchmark_flash_attn(context_lengths, d_models, dtypes):
                 start_time = timeit.default_timer()
                 flash_attn_bwd(q, k, v, False, do, context_length, d_model, dtype)
                 end_time = timeit.default_timer()
+                warmup_flash_attn_full_time = (end_time - start_time)*1000
                 logging.info(f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
-                    f", warmup flash_attn_bwd time: {(end_time - start_time)*1000:.2f} ms")
+                    f", warmup flash_attn_bwd time: {warmup_flash_attn_full_time:.2f} ms")
                 torch.cuda.synchronize()
 
                 flash_attn_full_time = triton.testing.do_bench(lambda: (flash_attn_bwd(q, k, v, False, do, context_length, d_model, dtype), torch.cuda.synchronize()))
@@ -207,38 +216,39 @@ def benchmark_flash_attn(context_lengths, d_models, dtypes):
                 'regular_attn_total_ms': round(regular_attn_full_time, 2),
                 'flash_attn_triton_forward_ms': round(triton_fwd_time, 2),
                 'flash_attn_backward_ms': round(flash_attn_bwd_time, 2),
-                'triton_total_ms': round(flash_attn_full_time, 2),
+                'flash_attn_total_ms': round(flash_attn_full_time, 2),
+                'warmup_regular_attn_fwd_ms': round(warmup_regular_attn_fwd_time, 2),
+                'warmup_regular_attn_full_ms': round(warmup_regular_attn_full_time, 2),
+                'warmup_flash_attn_fwd_ms': round(warmup_flash_attn_fwd_time, 2),
+                'warmup_flash_attn_full_ms': round(warmup_flash_attn_full_time, 2),
             })
 
             torch.cuda.empty_cache()
 
-    # Create DataFrames and convert to LaTeX tables
-    latex_tables = {}
+    # Create DataFrames and save
     for dtype, results in results_by_dtype.items():
         df = pd.DataFrame(results)
         dtype_str = str(dtype).split('.')[-1]
         save_file = f"flash_attn_benchmark_{dtype_str}.md"
         with open(save_file, "w") as f:
-            f.write(df.to_markdown(index=False))
+            markdown_result = df.to_markdown(index=False)
+            f.write(markdown_result)
 
-        latex_table = df.to_latex(index=False, float_format=lambda x: '{:.2f}'.format(x))
-        latex_tables[dtype_str] = latex_table
-        print("\nLaTeX Table:")
-        print(latex_table)
+        print("\nMarkdown Table:")
+        print(markdown_result)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark flashAttention.")
     #choices=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
     parser.add_argument("--context_length", type=str, help="Sequence context length")
-    parser.add_argument("--d_model", type=int, help="Model dimension", default="16", choices=[16, 32, 64, 128])
+    parser.add_argument("--d_model", type=int, help="Model dimension", choices=[16, 32, 64, 128])
     parser.add_argument("--dtype", type=str, help="Data type", default="bfloat16", choices=["bfloat16", "float32"])
     return parser.parse_args()
 
 def main():
     args = parse_args()
     if args.d_model:
-            # 将输入的字符串按逗号分割并转换为整数列表
         test_d_models = [args.d_model]
     else:
         test_d_models = d_models
