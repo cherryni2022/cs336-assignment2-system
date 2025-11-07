@@ -6,6 +6,7 @@ from typing import Tuple
 import logging
 import argparse
 import math
+import timeit
 from itertools import product
 
 logging.basicConfig(
@@ -38,7 +39,6 @@ def flash_attn_triton_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 def flash_attn_bwd(q, k, v, is_causal, do, context_length=None, d_model=None, dtype=None):
     with nvtx.range(f"flash_attn_forward_{context_length}_{d_model}_{dtype}"):
         out = FlashAttentionTritonImpl.apply(q, k, v, is_causal)
-    #out = flash_attn_triton_fwd(q, k, v, is_causal, context_length, d_model, dtype)
     with nvtx.range(f"flash_attn_backward_{context_length}_{d_model}_{dtype}"):
         out.backward(do)
 
@@ -94,36 +94,60 @@ def benchmark_flash_attn(context_lengths, d_models, dtypes):
                 q_tile_size = 16
                 k_tile_size = 16
 
+            regular_attn_fwd_time = 0
+            regular_attn_full_time = 0
+            regular_attn_bwd_time = 0
+            triton_fwd_time = 0
+            flash_attn_bwd_time = 0
+            flash_attn_full_time = 0
             # Benchmark regular pytorch attention
             q, k, v, do = generate_inputs(1, context_length, d_model, dtype)
             # 1.benchmark pytorch regular attention forward pass
             try:
+                #warmup for forward
+                start_time = timeit.default_timer()
+                pytorch_regular_attn_fwd(q, k, v, False, context_length, d_model, dtype)
+                end_time = timeit.default_timer()
+                logging.info(f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
+                    f", warmup pytorch_regular_attn_fwd time: {(end_time - start_time)*1000:.2f} ms")
+                torch.cuda.synchronize()
+
                 regular_attn_fwd_time = triton.testing.do_bench(lambda: pytorch_regular_attn_fwd(q, k, v, False, context_length, d_model, dtype))
                 logging.info(
                     f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
-                    f", pytorch_regular_attn_fwd forward pass regular_attn_fwd_time: {regular_attn_fwd_time:.2f} ms")
+                    f", pytorch_regular_attn_fwd regular_attn_fwd_time: {regular_attn_fwd_time:.2f} ms")
             except Exception as e:
-                logging.error(
+                logging.exception(
                     f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
                     f", Exception in pytorch_regular_attn_fwd: {e}")
+                torch.cuda.empty_cache()
 
             # 2.benchmark pytorch regular attention forward+backward pass
             try:
                 q.requires_grad_(True)
                 k.requires_grad_(True)
                 v.requires_grad_(True)
+                #warmup for backward
+                start_time = timeit.default_timer()
+                pytorch_regular_attn_bwd(q, k, v, False, do, context_length, d_model, dtype)
+                end_time = timeit.default_timer()
+                logging.info(f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
+                    f", warmup pytorch_regular_attn_bwd time: {(end_time - start_time)*1000:.2f} ms")
+                torch.cuda.synchronize()
+
                 regular_attn_full_time = triton.testing.do_bench(lambda: (pytorch_regular_attn_bwd(q, k, v, False, do, context_length, d_model, dtype), torch.cuda.synchronize()))
                 regular_attn_bwd_time = regular_attn_full_time - regular_attn_fwd_time
                 logging.info(
                     f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
-                    f", pytorch_regular_attn_bwd full pass: "
+                    f", pytorch_regular_attn_bwd: "
                     f" regular_attn_fwd_time:{regular_attn_fwd_time:.2f} ms"
                     f", regular_attn_bwd_time:{regular_attn_bwd_time:.2f} ms"
                     f", regular_attn_full_time:{regular_attn_full_time:.2f} ms")
             except Exception as e:
-                logging.error(
+                logging.exception(
                     f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
                     f", Exception in pytorch_regular_attn_bwd: {e}")
+                torch.cuda.empty_cache()
             
 
 
@@ -131,42 +155,49 @@ def benchmark_flash_attn(context_lengths, d_models, dtypes):
             # 3.benchmark triton flash attention forward pass
             q, k, v, do = generate_inputs(1, context_length, d_model, dtype)
             try:
+                #warmup for forward
+                start_time = timeit.default_timer()
+                flash_attn_triton_fwd(q, k, v, False, context_length, d_model, dtype)
+                end_time = timeit.default_timer()
+                logging.info(f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
+                    f", warmup flash_attn_triton_fwd time: {(end_time - start_time)*1000:.2f} ms")
+                torch.cuda.synchronize()
+
                 triton_fwd_time = triton.testing.do_bench(lambda: flash_attn_triton_fwd(q, k, v, False, context_length, d_model, dtype))
                 logging.info(
                     f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
-                    f", triton_flash_attn_fwd forward pass triton_fwd_time: {triton_fwd_time:.2f} ms")
+                    f", triton_flash_attn_fwd triton_fwd_time: {triton_fwd_time:.2f} ms")
             except Exception as e:
-                logging.error(
+                logging.exception(
                     f"benchmarking dtype={dtype}, context_length={context_length}, d_model={d_model}"
                     f", Exception in flash_attn_triton_fwd: {e}")
-                continue
+                torch.cuda.empty_cache()
             # 4.benchmark triton flash attention forward+backward pass
             try:
                 q.requires_grad_(True)
                 k.requires_grad_(True)
                 v.requires_grad_(True)
                 #warmup for backward: compile 耗时
-                for _ in range(3):
-                    start_time = timeit.default_timer()
-                    flash_attn_bwd(q, k, v, False, do, context_length, d_model, dtype)
-                    end_time = timeit.default_timer()
-                    logging.info(f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
-                        f", warmup flash_attn_bwd {_} time: {(end_time - start_time)*1000:.2f} ms")
+                start_time = timeit.default_timer()
+                flash_attn_bwd(q, k, v, False, do, context_length, d_model, dtype)
+                end_time = timeit.default_timer()
+                logging.info(f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
+                    f", warmup flash_attn_bwd time: {(end_time - start_time)*1000:.2f} ms")
                 torch.cuda.synchronize()
 
                 flash_attn_full_time = triton.testing.do_bench(lambda: (flash_attn_bwd(q, k, v, False, do, context_length, d_model, dtype), torch.cuda.synchronize()))
                 flash_attn_bwd_time = flash_attn_full_time - triton_fwd_time
                 logging.info(
                     f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
-                    f", flash_attn_bwd full pass "
+                    f", flash_attn_bwd"
                     f", triton_fwd_time:{triton_fwd_time:.2f} ms"
                     f", flash_attn_bwd_time:{flash_attn_bwd_time:.2f} ms"
                     f", flash_attn_full_time:{flash_attn_full_time:.2f} ms")
             except Exception as e:
-                logging.error(
+                logging.exception(
                     f"[dtype={dtype}, context_length={context_length}, d_model={d_model}]"
                     f", Exception in flash_attn_bwd full pass: {e}")
-                continue
+                torch.cuda.empty_cache()
             
             results_by_dtype[dtype].append({
                 'context_length': context_length,

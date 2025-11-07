@@ -2,6 +2,8 @@ import torch
 import math 
 import triton 
 import triton.language as tl 
+from einops import einsum
+import einx
 
 @triton.jit
 def flash_atten_fwd_kernel(
@@ -70,7 +72,7 @@ def flash_atten_fwd_kernel(
 
         K_j = tl.load(K_block_ptr, boundary_check=(0, 1))
         V_j = tl.load(V_block_ptr, boundary_check=(0, 1))
-        S_ij = tl.dot(Q_i.to(tl.float32), K_j.to(tl.float32)) * scale
+        S_ij = tl.dot(Q_i, K_j) * scale
 
         # Causal masking
         if is_causal:
@@ -212,13 +214,13 @@ def flash_atten_bwd2_kernel(
     )
 
     # Load tile data
-    Q_i = tl.load(Q_block_ptr, boundary_check=(0, 1)).to(tl.float32)
-    O_i = tl.load(O_block_ptr, boundary_check=(0, 1)).to(tl.float32)
-    L_i = tl.load(L_block_ptr, boundary_check=(0,)).to(tl.float32)
-    dO_i = tl.load(dO_block_ptr, boundary_check=(0, 1)).to(tl.float32)
+    Q_i = tl.load(Q_block_ptr, boundary_check=(0, 1))
+    O_i = tl.load(O_block_ptr, boundary_check=(0, 1))
+    L_i = tl.load(L_block_ptr, boundary_check=(0,))
+    dO_i = tl.load(dO_block_ptr, boundary_check=(0, 1))
 
     # Accumulator for dQ_i
-    dQ_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    dQ_i = tl.zeros((Q_TILE_SIZE, D))
 
     # Query indices for masking and bounds
     q_indices = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
@@ -244,8 +246,8 @@ def flash_atten_bwd2_kernel(
             order=(1, 0)
         )
 
-        K_j = tl.load(K_block_ptr, boundary_check=(0, 1)).to(tl.float32)
-        V_j = tl.load(V_block_ptr, boundary_check=(0, 1)).to(tl.float32)
+        K_j = tl.load(K_block_ptr, boundary_check=(0, 1))
+        V_j = tl.load(V_block_ptr, boundary_check=(0, 1))
 
         # Attention scores S_ij
         S_ij = tl.dot(Q_i, K_j) * scale
@@ -302,7 +304,7 @@ class FlashAttentionTritonImpl(torch.autograd.Function):
         scale = head_dim ** -0.5
 
         O = torch.empty_like(Q)
-        L = torch.empty((batch_size, q_len), device=Q.device, dtype=torch.float32)
+        L = torch.empty((batch_size, q_len), device=Q.device, dtype=Q.dtype)
 
         Q_TILE_SIZE, K_TILE_SIZE = 64, 64
         T_q = math.ceil(q_len / Q_TILE_SIZE)
@@ -317,7 +319,7 @@ class FlashAttentionTritonImpl(torch.autograd.Function):
             L.stride(0), L.stride(1),
             q_len, k_len, head_dim, scale,
             D=head_dim, Q_TILE_SIZE=Q_TILE_SIZE, K_TILE_SIZE=K_TILE_SIZE,
-            is_causal=is_causal,
+            is_causal=is_causal
         )
 
         ctx.save_for_backward(Q, K, V, O, L)
@@ -327,7 +329,7 @@ class FlashAttentionTritonImpl(torch.autograd.Function):
     @staticmethod
     @torch.compile(fullgraph=True)
     def backward(ctx, dO):
-        O, L, Q, K, V = ctx.saved_tensors
+        Q, K, V, O, L = ctx.saved_tensors
         d = K.shape[-1]
         S = einsum(Q, K, "b s1 d, b s2 d->b s1 s2")/d**0.5
         if ctx.is_causal:
@@ -368,14 +370,14 @@ class FlashAttentionTritonImpl(torch.autograd.Function):
         grid = (T_q, batch_size)
 
         flash_atten_bwd2_kernel[grid](
-            Q, K, V, O, L, grad_O,
+            Q, K, V, O, L, dO,
             dQ, dK, dV,
             Q.stride(0), Q.stride(1), Q.stride(2),
             K.stride(0), K.stride(1), K.stride(2),
             V.stride(0), V.stride(1), V.stride(2),
             O.stride(0), O.stride(1), O.stride(2),
             L.stride(0), L.stride(1),
-            grad_O.stride(0), grad_O.stride(1), grad_O.stride(2),
+            dO.stride(0), dO.stride(1), dO.stride(2),
             dQ.stride(0), dQ.stride(1), dQ.stride(2),
             dK.stride(0), dK.stride(1), dK.stride(2),
             dV.stride(0), dV.stride(1), dV.stride(2),
