@@ -84,20 +84,15 @@ def naive_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
                     loss.backward()
                     
                     with nvtx.range("naive_ddp_communicate"):
-                        network_start_time = timer()
                         for param in model.parameters():
                             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, async_op=False)
-                    
-                    torch.cuda.synchronize()
-                    netwark_time = (timer() - network_start_time) * 1000
-                    communicate_times.append(netwark_time)
-                    logging.info(f"naive_ddp {rank}/{world_size} step {step} communicate time {netwark_time:.2f} ms")
 
                     optimizer.step()
             
             torch.cuda.synchronize()
             train_time = (timer() - step_start_time) * 1000
             train_times.append(train_time)
+            communicate_times.append(1)
             logging.info(f"naive_ddp {rank}/{world_size} step {step} train time {train_time:.2f} ms")
 
 
@@ -170,20 +165,15 @@ def flat_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
                     torch.cuda.synchronize()
 
                     with nvtx.range("flat_ddp_communicate"):
-                        network_start_time = timer()
                         # 使用分批处理策略避免内存溢出
                         chunked_all_reduce_gradients(model, chunk_size_mb=50)
-            
-                    torch.cuda.synchronize()
-                    netwark_time = (timer() - network_start_time) * 1000
-                    communicate_times.append(netwark_time)
-                    logging.info(f"flat_ddp {rank}/{world_size} step {step} netwark_time: {netwark_time:.2f} ms")
 
                     optimizer.step()
 
             torch.cuda.synchronize()
             train_time = (timer() - step_start_time) * 1000
             train_times.append(train_time)
+            communicate_times.append(1)
             logging.info(f"flat_ddp {rank}/{world_size} step {step} train time {train_time:.2f} ms")
 
 @nvtx.range("individual_ddp")
@@ -199,9 +189,9 @@ def individual_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
                 loss.backward()
                 model.finish_gradient_synchronization()
                 optimizer.step()
-        
+
+        torch.cuda.synchronize()
         logging.info(f"start individual_ddp {rank}/{world_size} train")
-        
         for step in range(num_train_steps):
             step_start_time = timer()
             with nvtx.range("individual_ddp_train"):
@@ -212,18 +202,14 @@ def individual_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
                     loss.backward()
 
                     with nvtx.range("individual_ddp_communicate"):
-                        # network_start_time = timer()
                         model.finish_gradient_synchronization()
                     
-                    # torch.cuda.synchronize()
-                    # netwark_time = (timer() - network_start_time) * 1000
-                    # communicate_times.append(netwark_time)
-                    # logging.info(f"individual_ddp {rank}/{world_size} step {step} netwark_time: {netwark_time:.2f} ms")
                     optimizer.step()
 
             torch.cuda.synchronize()
             train_time = (timer() - step_start_time) * 1000
             train_times.append(train_time)
+            communicate_times.append(1)
             logging.info(f"individual_ddp {rank}/{world_size} step {step} train time {train_time:.2f} ms")
 
 @nvtx.range("bucket_ddp")
@@ -240,7 +226,8 @@ def bucket_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
                 loss.backward()
                 model.finish_gradient_synchronization()
                 optimizer.step()
-        
+        torch.cuda.synchronize()
+
         logging.info(f"start bucket_ddp {rank}/{world_size} train")
         for step in range(num_train_steps):
             step_start_time = timer()
@@ -250,21 +237,16 @@ def bucket_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
                     outputs = model(train_x)
                     loss = lossfn(outputs.view(-1, vocab_size), train_y.view(-1))
                     loss.backward()
-                    torch.cuda.synchronize()
 
                     with nvtx.range("bucket_ddp_communicate"):
-                        # network_start_time = timer()
                         model.finish_gradient_synchronization()
 
-                    # torch.cuda.synchronize()
-                    # netwark_time = (timer() - network_start_time) * 1000
-                    # communicate_times.append(netwark_time)
-                    # logging.info(f"bucket_ddp {rank}/{world_size} step {step} netwark_time: {netwark_time:.2f} ms")
                     optimizer.step()
 
             torch.cuda.synchronize()
             train_time = (timer() - step_start_time) * 1000
             train_times.append(train_time)
+            communicate_times.append(1)
             logging.info(f"bucket_ddp {rank}/{world_size} step {step} train time: {train_time:.2f} ms")
 
 """
@@ -390,17 +372,11 @@ if __name__ == "__main__":
     
     # Get results from Queue
     train_times, comms_times = result_queue.get()
-    # Get results from Queue
-    train_times, comms_times = result_queue.get()
+    logging.info("received results from worker queue")
     avg_train_time = mean(train_times)
     avg_comms_time = mean(comms_times)
     logging.info(f"Average train_step time:{avg_train_time:.2f} ms."
                 f"Average communication time:{avg_comms_time:.2f} ms."
                 f"Average communication ratio:{avg_comms_time / avg_train_time:.2%}")
-    if dist.is_initialized():
-        try:
-            dist.destroy_process_group()
-        except Exception as e:
-            logging.exception(
-                    f"main Exception: {e}")
+    
     logging.info("finish benchmark.")

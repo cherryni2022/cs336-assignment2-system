@@ -3,13 +3,10 @@ from __future__ import annotations
 from typing import Type
 
 import torch
-#from cs336_systems.flash_attention import FlashAttention2Forward, TritonFlashAttention2
 from cs336_systems.flash_atten.flash_atten_pytorch import FlashAttentionPytorchImpl
 from cs336_systems.flash_atten.flash_atten_triton import FlashAttentionTritonImpl
-# from cs336_systems.paralism.individual_ddp import IndividualDDP
-# from cs336_systems.paralism.individual_bucketed_ddp import DDP_Bucketed
-# from cs336_systems.paralism.optimizer_sharding import OptimizerSharding
 from cs336_systems.parallel.bucket_ddp import BucketDDP
+from cs336_systems.parallel.ddp import DDPBucketed
 from cs336_systems.parallel.individual_ddp import IndividualOverlapDDP
 
 
@@ -99,7 +96,7 @@ def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn
     Returns:
         Instance of a DDP class.
     """
-    from cs336_systems.parallel.ddp import DDPBucketed
+    
     return DDPBucketed(module, bucket_size_mb)
     # return BucketDDP(module, bucket_size_mb)
 

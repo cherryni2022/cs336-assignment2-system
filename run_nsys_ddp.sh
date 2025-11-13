@@ -11,9 +11,15 @@ echo "当前时间: $current_time"
 #small,medium,large,xl,2.7B
 model_type=large
 #naive,flat_dpp,individual_ddp, bucketed_ddp
-ddp_type=naive
-#python cs336_systems/parallel/ddp_all_benchmark.py --ddp_type naive --model_type $model_type > benchmark_${ddp_type}_${model_type}_${current_time}.log 2>&1
-python cs336_systems/parallel/ddp_nsys_benchmark.py --ddp_type naive --model_type $model_type > benchmark_${ddp_type}_${model_type}_${current_time}.log 2>&1
+#ddp_type=naive
+#ddp_type=flat_ddp
+#ddp_type=individual_ddp
+#python cs336_systems/parallel/ddp_all_benchmark.py --ddp_type $ddp_type --model_type $model_type > benchmark_${ddp_type}_${model_type}_${current_time}.log 2>&1
+ddp_type=bucketed_ddp
+#1MB,10MB,100MB,1000MB
+bucket_size_mb=100
+python cs336_systems/parallel/ddp_all_benchmark.py --ddp_type $ddp_type --model_type $model_type --bucket_size_mb $bucket_size_mb > benchmark_${ddp_type}_${model_type}_${current_time}.log 2>&1
+#python cs336_systems/parallel/ddp_nsys_benchmark.py --ddp_type naive --model_type $model_type > benchmark_${ddp_type}_${model_type}_${current_time}.log 2>&1
 #nsys profile --trace=cuda,nvtx,osrt --capture-range=nvtx --python-backtrace=cuda --force-overwrite true -o result_ddp_naive python cs336_systems/parallel/ddp_all_benchmark.py --ddp_type naive --model_type $model_type
 #nsys profile --trace=cuda,nvtx,osrt --capture-range=nvtx --python-backtrace=cuda --force-overwrite true -o result_ddp_flat python cs336_systems/parallel/ddp_all_benchmark.py --ddp_type flat_ddp --model_type large
 #nsys profile --trace=cuda,nvtx,osrt --capture-range=nvtx --python-backtrace=cuda --force-overwrite true -o result_ddp_individual python cs336_systems/parallel/ddp_all_benchmark.py --ddp_type individual_ddp --model_type large
