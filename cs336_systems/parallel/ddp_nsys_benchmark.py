@@ -97,12 +97,12 @@ def naive_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
 
 
 # 梯度批量打包通讯
-def chunked_all_reduce_gradients(model, chunk_size_mb=1024):
+def chunked_all_reduce_gradients(model, chunk_size_mb=2048):
     """分批处理梯度的all_reduce操作，避免内存溢出"""
     params_with_grad = [p for p in model.parameters() if p.grad is not None]
     if not params_with_grad:
         return
-    
+    #logging.info(f"chunked_all_reduce_gradients chunk_size_mb: {chunk_size_mb}")
     chunk_size_bytes = chunk_size_mb * 1024 * 1024
     current_chunk = []
     current_size = 0
@@ -140,7 +140,7 @@ def chunked_all_reduce_gradients(model, chunk_size_mb=1024):
 @nvtx.range("flat_ddp")
 def flat_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn, 
             num_train_steps, num_warmup_steps, train_times, communicate_times, 
-            device, model_type):
+            device, model_type, chunk_size_mb):
         logging.info(f"start flat_ddp {rank}/{world_size} warmup")
         for step in range(num_warmup_steps):
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
@@ -150,7 +150,7 @@ def flat_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
                 loss.backward()
 
                 # 使用分批处理策略避免内存溢出
-                chunked_all_reduce_gradients(model, chunk_size_mb=50)
+                chunked_all_reduce_gradients(model, chunk_size_mb=chunk_size_mb)
                 optimizer.step()
 
         logging.info(f"start flat_ddp {rank}/{world_size} train")
@@ -166,7 +166,7 @@ def flat_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
 
                     with nvtx.range("flat_ddp_communicate"):
                         # 使用分批处理策略避免内存溢出
-                        chunked_all_reduce_gradients(model, chunk_size_mb=50)
+                        chunked_all_reduce_gradients(model, chunk_size_mb=chunk_size_mb)
 
                     optimizer.step()
 
@@ -256,7 +256,7 @@ def bucket_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
 def benchmark(rank, world_size, 
                 train_x, train_y, model_config, batch_size,
                 num_train_steps, num_warmup_steps,
-                ddp_type, bucket_size_mb, model_type, result_queue
+                ddp_type, bucket_size_mb, chunk_size_mb, model_type, result_queue
                 ):
     logging.info(f"start benchmark {ddp_type} at rank:{rank}/{world_size}")
     setup(rank, world_size)
@@ -294,7 +294,7 @@ def benchmark(rank, world_size,
         if ddp_type == "flat_ddp":
             flat_ddp(rank, world_size, transformer_model, train_x, train_y, optimizer, lossfn, 
             num_train_steps, num_warmup_steps, train_times, communicate_times, 
-            device, model_type)
+            device, model_type, chunk_size_mb)
         if ddp_type == "individual_ddp":
             individual_ddp(rank, world_size, transformer_model, train_x, train_y, optimizer, lossfn, 
                     num_train_steps, num_warmup_steps, 
@@ -341,6 +341,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark Transformer models.")
     parser.add_argument("--ddp_type", type=str, default="naive", choices=["naive", "flat_ddp", "individual_ddp", "bucketed_ddp"])
     parser.add_argument("--bucket_size_mb", type=float, default=100)
+    parser.add_argument("--chunk_size_mb", type=float, default=1024)
     parser.add_argument("--batch_size", type=int, default="16", choices=[16,32,64,128])
     parser.add_argument("--model_type", type=str, default="xl", choices=["medium", "large","xl","2.7B"])
     args = parser.parse_args()
@@ -348,7 +349,8 @@ if __name__ == "__main__":
     test_batch_size = args.batch_size if args.batch_size else batch_size
 
     logging.info(f"ddp_type:{args.ddp_type}, batch_size:{test_batch_size}, "
-            f"model_type:{args.model_type}")
+            f"model_type:{args.model_type}, chunk_size_mb:{args.chunk_size_mb},"
+            f"bucket_size_mb:{args.bucket_size_mb}")
 
     mp.set_start_method("spawn", force=True)
     manager = Manager()
@@ -365,7 +367,7 @@ if __name__ == "__main__":
     mp.spawn(benchmark, 
             args=(world_size, train_x, train_y, model_config, test_batch_size,
             train_steps, warmup_steps, args.ddp_type, 
-            args.bucket_size_mb, args.model_type,
+            args.bucket_size_mb, args.chunk_size_mb, args.model_type,
             result_queue), 
             nprocs=world_size,
             join=True)

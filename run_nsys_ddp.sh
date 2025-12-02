@@ -10,12 +10,12 @@ echo "当前时间: $current_time"
 
 #xl model
 model_type=xl
-#naive,flat_dpp,individual_ddp, bucketed_ddp
+#naive,flat_ddp,individual_ddp, bucketed_ddp
 #ddp_type=naive
 ddp_type=flat_ddp
 #ddp_type=individual_ddp
 
-#python timer 统计train和通信耗时
+# 1. python timer 统计train和通信耗时
 #python cs336_systems/parallel/ddp_all_benchmark.py --ddp_type $ddp_type --model_type $model_type > benchmark_${ddp_type}_${model_type}_${current_time}.log 2>&1
 #ddp_type=bucketed_ddp
 #1MB,10MB,100MB,1000MB
@@ -23,10 +23,11 @@ ddp_type=flat_ddp
 #python cs336_systems/parallel/ddp_all_benchmark.py --ddp_type $ddp_type --model_type $model_type --bucket_size_mb $bucket_size_mb > benchmark_${ddp_type}_${model_type}_${current_time}.log 2>&1
 
 
-#nsys profile
+# 2. nsys profile
 #python cs336_systems/parallel/ddp_nsys_benchmark.py --ddp_type $ddp_type --model_type $model_type > benchmark_${ddp_type}_${model_type}_${current_time}.log 2>&1
-#naive,flat_dpp,individual_ddp, bucketed_ddp
-# ddp_type=individual_ddp
+#naive,flat_ddp,individual_ddp, bucketed_ddp
+# ddp_type=naive
+# chunk_size_mb=1024
 # nsys profile \
 #     --trace=cuda,nvtx,osrt \
 #     --python-backtrace=cuda \
@@ -34,12 +35,13 @@ ddp_type=flat_ddp
 #     -o "nsys_${ddp_type}_${model_type}" \
 #     python cs336_systems/parallel/ddp_nsys_benchmark.py \
 #     --ddp_type $ddp_type \
-#     --model_type $model_type > \
+#     --model_type $model_type \
+#     --chunk_size_mb $chunk_size_mb > \
 #     benchmark_${ddp_type}_${model_type}_${current_time}.log 2>&1
 
 ddp_type=bucketed_ddp
 #1MB,10MB,100MB,1000MB
-bucket_size_mb=1000
+bucket_size_mb=1
 nsys profile \
     --trace=cuda,nvtx,osrt \
     --python-backtrace=cuda \
