@@ -18,7 +18,6 @@ logging.basicConfig(
 # torch.autograd.set_detect_anomaly(True)
 # torch._inductor.config.debug = True
 
-#from cs336_systems.flash_atten.flash_attention import TritonFlashAttention2
 from cs336_systems.flash_atten.flash_atten_triton import FlashAttentionTritonImpl
 from cs336_basics.model import scaled_dot_product_attention
 

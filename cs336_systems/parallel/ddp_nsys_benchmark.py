@@ -97,7 +97,7 @@ def naive_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
 
 
 # 梯度批量打包通讯
-def chunked_all_reduce_gradients(model, chunk_size_mb=50):
+def chunked_all_reduce_gradients(model, chunk_size_mb=1024):
     """分批处理梯度的all_reduce操作，避免内存溢出"""
     params_with_grad = [p for p in model.parameters() if p.grad is not None]
     if not params_with_grad:
@@ -201,8 +201,8 @@ def individual_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
                     loss = lossfn(outputs.view(-1, vocab_size), train_y.view(-1))
                     loss.backward()
 
-                    with nvtx.range("individual_ddp_communicate"):
-                        model.finish_gradient_synchronization()
+                    #with nvtx.range("individual_ddp_communicate"):
+                    model.finish_gradient_synchronization()
                     
                     optimizer.step()
 
@@ -238,12 +238,12 @@ def bucket_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
                     loss = lossfn(outputs.view(-1, vocab_size), train_y.view(-1))
                     loss.backward()
 
-                    with nvtx.range("bucket_ddp_communicate"):
-                        model.finish_gradient_synchronization()
+                    #with nvtx.range("bucket_ddp_communicate"):
+                    model.finish_gradient_synchronization()
 
                     optimizer.step()
 
-            torch.cuda.synchronize()
+            #torch.cuda.synchronize()
             train_time = (timer() - step_start_time) * 1000
             train_times.append(train_time)
             communicate_times.append(1)

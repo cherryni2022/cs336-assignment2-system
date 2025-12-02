@@ -151,7 +151,7 @@ def flat_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
                 loss = lossfn(outputs.view(-1, vocab_size), train_y.view(-1))
                 loss.backward()
                 # 使用分批处理策略避免内存溢出
-                chunked_all_reduce_gradients(model, chunk_size_mb=50)
+                chunked_all_reduce_gradients(model, chunk_size_mb=100)
                 optimizer.step()
 
         torch.cuda.synchronize()
@@ -168,7 +168,7 @@ def flat_ddp(rank, world_size, model, train_x, train_y, optimizer, lossfn,
                 
                 network_start_time = timer()
                 # 使用分批处理策略避免内存溢出
-                chunked_all_reduce_gradients(model, chunk_size_mb=10)
+                chunked_all_reduce_gradients(model, chunk_size_mb=50)
 
                 torch.cuda.synchronize()
                 netwark_time = (timer() - network_start_time) * 1000
